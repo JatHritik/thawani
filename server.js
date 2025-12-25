@@ -42,21 +42,33 @@ async function refreshZohoToken() {
 }
 
 // ================================
-// 🔹 FETCH UNPAID INVOICES
+// 🔹 FETCH SINGLE INVOICE BY ID
 // ================================
-async function fetchUnpaidInvoices() {
+async function fetchInvoiceById(invoice_id) {
   const res = await axios.get(
-    "https://www.zohoapis.com/books/v3/invoices",
+    `https://www.zohoapis.com/books/v3/invoices/${invoice_id}`,
     {
-      params: { status: "unpaid" },
+      params: { organization_id },
       headers: {
         Authorization: `Zoho-oauthtoken ${Zoho_Access_Token}`,
-        "X-com-zoho-books-organizationid": organization_id,
       },
     }
   );
 
-  return res.data.invoices || [];
+  return res.data.invoice;
+}
+
+// ================================
+// 🔹 DUPLICATE CHECK
+// ================================
+function hasPaymentLink(invoice) {
+  if (!invoice.custom_fields) return false;
+
+  const field = invoice.custom_fields.find(
+    (f) => f.api_name === "cf_payment_link"
+  );
+
+  return field && field.value;
 }
 
 // ================================
@@ -67,7 +79,10 @@ async function updateInvoiceWithPaymentLink(invoice_id, paymentLink) {
     `https://www.zohoapis.com/books/v3/invoices/${invoice_id}?organization_id=${organization_id}`,
     {
       custom_fields: [
-        { api_name: "cf_payment_link", value: paymentLink },
+        {
+          api_name: "cf_payment_link",
+          value: paymentLink,
+        },
       ],
     },
     {
@@ -91,7 +106,7 @@ async function createZohoCustomerPayment(invoice, thawaniSession) {
     amount: invoice.total,
     date: new Date().toISOString().split("T")[0],
 
-    // ✅ < 50 chars
+    // ✅ always < 50 chars
     reference_number: `THW-${invoice.invoice_number}`,
 
     description: `Thawani Session ID: ${thawaniSession.session_id}`,
@@ -118,13 +133,23 @@ async function createZohoCustomerPayment(invoice, thawaniSession) {
     }
   );
 
-  console.log("✅ Zoho Payment Created:", res.data);
+  console.log("✅ ZOHO PAYMENT CREATED");
+  return res.data;
 }
 
 // ================================
 // 🔹 CREATE THAWANI SESSION
 // ================================
 async function createThawaniPaymentSession(invoice) {
+
+  // 🛑 DUPLICATE PREVENTION
+  if (hasPaymentLink(invoice)) {
+    console.log(
+      `⏭️ Invoice ${invoice.invoice_number} already has payment link`
+    );
+    return { skipped: true };
+  }
+
   const res = await axios.post(
     "https://checkout.thawani.om/api/v1/checkout/session",
     {
@@ -164,30 +189,46 @@ async function createThawaniPaymentSession(invoice) {
   console.log("💳 PAYMENT LINK:", paymentLink);
   console.log("=========================================================");
 
+  // ✅ STEP 1: CREATE PAYMENT
   await createZohoCustomerPayment(invoice, thawaniData);
+
+  // ✅ STEP 2: UPDATE INVOICE
   await updateInvoiceWithPaymentLink(invoice.invoice_id, paymentLink);
+
+  return { paymentLink };
 }
 
 // ================================
-// 🔹 ROUTE (HIT THIS)
+// 🔹 ROUTE (ZOHO BUTTON HITS THIS)
 // ================================
 app.get("/run-thawani-sync", async (req, res) => {
   try {
-    await refreshZohoToken();
-    const invoices = await fetchUnpaidInvoices();
+    const { invoice_id } = req.query;
 
-    for (const invoice of invoices) {
-      await createThawaniPaymentSession(invoice);
+    if (!invoice_id) {
+      return res.status(400).json({
+        success: false,
+        message: "invoice_id is required",
+      });
     }
+
+    await refreshZohoToken();
+
+    const invoice = await fetchInvoiceById(invoice_id);
+
+    const result = await createThawaniPaymentSession(invoice);
 
     res.json({
       success: true,
-      message: "Thawani + Zoho sync completed",
-      invoices_processed: invoices.length,
+      invoice_id,
+      result,
     });
   } catch (err) {
     console.error(err);
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
   }
 });
 
@@ -196,5 +237,4 @@ app.get("/run-thawani-sync", async (req, res) => {
 // ================================
 app.listen(PORT, () => {
   console.log(`🚀 Server running at http://localhost:${PORT}`);
-  console.log(`👉 HIT: http://localhost:${PORT}/run-thawani-sync`);
 });
