@@ -38,11 +38,10 @@ async function refreshZohoToken() {
   );
 
   Zoho_Access_Token = res.data.access_token;
-  console.log("✅ Zoho Access Token generated");
 }
 
 // ================================
-// 🔹 FETCH SINGLE INVOICE BY ID
+// 🔹 FETCH SINGLE INVOICE
 // ================================
 async function fetchInvoiceById(invoice_id) {
   const res = await axios.get(
@@ -59,45 +58,7 @@ async function fetchInvoiceById(invoice_id) {
 }
 
 // ================================
-// 🔹 DUPLICATE CHECK
-// ================================
-function hasPaymentLink(invoice) {
-  if (!invoice.custom_fields) return false;
-
-  const field = invoice.custom_fields.find(
-    (f) => f.api_name === "cf_payment_link"
-  );
-
-  return field && field.value;
-}
-
-// ================================
-// 🔹 UPDATE INVOICE WITH PAYMENT LINK
-// ================================
-async function updateInvoiceWithPaymentLink(invoice_id, paymentLink) {
-  await axios.put(
-    `https://www.zohoapis.com/books/v3/invoices/${invoice_id}?organization_id=${organization_id}`,
-    {
-      custom_fields: [
-        {
-          api_name: "cf_payment_link",
-          value: paymentLink,
-        },
-      ],
-    },
-    {
-      headers: {
-        Authorization: `Zoho-oauthtoken ${Zoho_Access_Token}`,
-        "Content-Type": "application/json",
-      },
-    }
-  );
-
-  console.log("🔗 Invoice updated with payment link");
-}
-
-// ================================
-// 🔹 CREATE CUSTOMER PAYMENT (ZOHO)
+// 🔹 CREATE PAYMENT IN ZOHO (ONLY WHEN PAID)
 // ================================
 async function createZohoCustomerPayment(invoice, thawaniSession) {
   const payload = {
@@ -105,11 +66,8 @@ async function createZohoCustomerPayment(invoice, thawaniSession) {
     payment_mode: "Thawani",
     amount: invoice.total,
     date: new Date().toISOString().split("T")[0],
-
-    // ✅ always < 50 chars
     reference_number: `THW-${invoice.invoice_number}`,
-
-    description: `Thawani Session ID: ${thawaniSession.session_id}`,
+    description: `Thawani Session: ${thawaniSession.session_id}`,
     account_name: "Bank Muscat 03710247642710019",
     invoices: [
       {
@@ -119,37 +77,38 @@ async function createZohoCustomerPayment(invoice, thawaniSession) {
     ],
   };
 
-  console.log("\n📤 ZOHO PAYMENT PAYLOAD:");
-  console.log(JSON.stringify(payload, null, 2));
-
-  const res = await axios.post(
+  await axios.post(
     `https://www.zohoapis.com/books/v3/customerpayments?organization_id=${organization_id}`,
     payload,
     {
       headers: {
         Authorization: `Zoho-oauthtoken ${Zoho_Access_Token}`,
-        "Content-Type": "application/json",
       },
     }
   );
 
-  console.log("✅ ZOHO PAYMENT CREATED");
-  return res.data;
+  // mark invoice as synced
+  await axios.put(
+    `https://www.zohoapis.com/books/v3/invoices/${invoice.invoice_id}?organization_id=${organization_id}`,
+    {
+      custom_fields: [
+        { api_name: "cf_payment_synced", value: true },
+      ],
+    },
+    {
+      headers: {
+        Authorization: `Zoho-oauthtoken ${Zoho_Access_Token}`,
+      },
+    }
+  );
+
+  console.log(`✅ Payment created for invoice ${invoice.invoice_number}`);
 }
 
 // ================================
-// 🔹 CREATE THAWANI SESSION
+// 🔹 CREATE THAWANI SESSION (BUTTON)
 // ================================
-async function createThawaniPaymentSession(invoice) {
-
-  // 🛑 DUPLICATE PREVENTION
-  if (hasPaymentLink(invoice)) {
-    console.log(
-      `⏭️ Invoice ${invoice.invoice_number} already has payment link`
-    );
-    return { skipped: true };
-  }
-
+async function createThawaniSession(invoice) {
   const res = await axios.post(
     "https://checkout.thawani.om/api/v1/checkout/session",
     {
@@ -159,76 +118,111 @@ async function createThawaniPaymentSession(invoice) {
         {
           name: `Invoice ${invoice.invoice_number}`,
           quantity: 1,
-          unit_amount: Math.min(
-            Math.round(invoice.total * 1000),
-            5000000
-          ),
+          unit_amount: Math.round(invoice.total * 1000),
         },
       ],
       success_url: "https://thw.om/success",
       cancel_url: "https://thw.om/cancel",
       metadata: {
         invoice_id: invoice.invoice_id,
-        customer_name: invoice.customer_name,
       },
     },
     {
       headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
         "thawani-api-key": secretKey,
       },
     }
   );
 
-  const thawaniData = res.data.data;
-  const paymentLink = `https://checkout.thawani.om/pay/${thawaniData.session_id}?key=${publicKey}`;
+  const session = res.data.data;
+  const paymentLink = `https://checkout.thawani.om/pay/${session.session_id}?key=${publicKey}`;
 
-  console.log("\n================ THAWANI SESSION RESPONSE ================");
-  console.log(JSON.stringify(res.data, null, 2));
-  console.log("💳 PAYMENT LINK:", paymentLink);
-  console.log("=========================================================");
+  // save payment link
+  await axios.put(
+    `https://www.zohoapis.com/books/v3/invoices/${invoice.invoice_id}?organization_id=${organization_id}`,
+    {
+      custom_fields: [
+        { api_name: "cf_payment_link", value: paymentLink },
+      ],
+    },
+    {
+      headers: {
+        Authorization: `Zoho-oauthtoken ${Zoho_Access_Token}`,
+      },
+    }
+  );
 
-  // ✅ STEP 1: CREATE PAYMENT
-  await createZohoCustomerPayment(invoice, thawaniData);
-
-  // ✅ STEP 2: UPDATE INVOICE
-  await updateInvoiceWithPaymentLink(invoice.invoice_id, paymentLink);
-
-  return { paymentLink };
+  return paymentLink;
 }
 
 // ================================
-// 🔹 ROUTE (ZOHO BUTTON HITS THIS)
+// 🔹 AUTO VERIFY PAYMENTS (EVERY 1 MIN)
 // ================================
-app.get("/run-thawani-sync", async (req, res) => {
+async function autoVerifyPayments() {
+  await refreshZohoToken();
+
+  const res = await axios.get(
+    "https://www.zohoapis.com/books/v3/invoices",
+    {
+      params: { status: "unpaid", organization_id },
+      headers: {
+        Authorization: `Zoho-oauthtoken ${Zoho_Access_Token}`,
+      },
+    }
+  );
+
+  const invoices = res.data.invoices || [];
+
+  for (const invoice of invoices) {
+    const synced = invoice.custom_fields?.find(
+      f => f.api_name === "cf_payment_synced"
+    );
+
+    if (synced?.value === true) continue;
+
+    const linkField = invoice.custom_fields?.find(
+      f => f.api_name === "cf_payment_link"
+    );
+
+    if (!linkField?.value) continue;
+
+    const match = linkField.value.match(/pay\/(checkout_[^?]+)/);
+    if (!match) continue;
+
+    const session_id = match[1];
+
+    const verify = await axios.get(
+      `https://checkout.thawani.om/api/v1/checkout/session/${session_id}`,
+      {
+        headers: { "thawani-api-key": secretKey },
+      }
+    );
+
+    if (verify.data.data.payment_status === "paid") {
+      await createZohoCustomerPayment(invoice, verify.data.data);
+    }
+  }
+}
+
+// ================================
+// 🔹 ROUTE (ZOHO BUTTON)
+// ================================
+app.get("/generate-payment-link", async (req, res) => {
   try {
     const { invoice_id } = req.query;
-
-    if (!invoice_id) {
-      return res.status(400).json({
-        success: false,
-        message: "invoice_id is required",
-      });
-    }
+    if (!invoice_id) return res.status(400).json({ error: "invoice_id required" });
 
     await refreshZohoToken();
-
     const invoice = await fetchInvoiceById(invoice_id);
-
-    const result = await createThawaniPaymentSession(invoice);
+    const link = await createThawaniSession(invoice);
 
     res.json({
       success: true,
       invoice_id,
-      result,
+      payment_link: link,
     });
   } catch (err) {
-    console.error(err);
-    res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -236,5 +230,9 @@ app.get("/run-thawani-sync", async (req, res) => {
 // 🔹 START SERVER
 // ================================
 app.listen(PORT, () => {
-  console.log(`🚀 Server running at http://localhost:${PORT}`);
+  console.log(`🚀 Server running on http://localhost:${PORT}`);
+  console.log(`⏱️ Auto payment verification running every 1 minute`);
 });
+
+// ⏱️ RUN EVERY 1 MINUTE
+setInterval(autoVerifyPayments, 60 * 1000);
